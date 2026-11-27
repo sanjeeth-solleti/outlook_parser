@@ -1,4 +1,4 @@
-# Microsoft Outlook Forensic Suite
+# Microsoft Outlook Parser
 
 A standalone digital forensics tool for parsing, decoding, analyzing, and viewing **Microsoft Outlook** artifacts — including **New Outlook for Windows (`Olk` / WebView2 LevelDB & IndexedDB)**, **Classic Outlook `.ost` & `.pst` files**, and **standalone `.msg`, `.eml`, & `.mbox` files**.
 
