@@ -35,6 +35,7 @@ import email.policy
 import email.utils
 import email.header
 import mailbox
+import urllib.parse
 from collections import defaultdict, Counter
 from flask import Flask, request, jsonify, send_file, render_template_string, redirect
 
@@ -543,43 +544,325 @@ def decode_rtf_body(rtf_raw):
 
     return rtf_str, extracted_html, extracted_plain
 
+def unwrap_idb_list(raw_obj):
+    """
+    Unwraps V8 / Chromium IndexedDB JSArray dicts ({'values': [...], 'properties': {'0': ...}})
+    or Graph/EWS container dicts into a clean Python list of elements.
+    """
+    if not raw_obj:
+        return []
+    if isinstance(raw_obj, str):
+        s = raw_obj.strip()
+        if s.startswith("[") or s.startswith("{"):
+            try:
+                raw_obj = json.loads(s)
+            except Exception:
+                return []
+        else:
+            return []
+    if isinstance(raw_obj, (list, tuple, set)):
+        return [x for x in raw_obj if x is not None]
+    if isinstance(raw_obj, dict):
+        if "values" in raw_obj or "properties" in raw_obj:
+            vals = raw_obj.get("values")
+            props = raw_obj.get("properties")
+            result = []
+            if isinstance(vals, list):
+                result = [x for x in vals if x is not None]
+            if isinstance(props, dict) and props:
+                prop_items = []
+                for pk, pv in props.items():
+                    if pv is not None and isinstance(pv, dict):
+                        try:
+                            idx_num = int(pk)
+                        except Exception:
+                            idx_num = 999999
+                        prop_items.append((idx_num, pv))
+                prop_items.sort(key=lambda t: t[0])
+                if not result:
+                    result = [pv for _, pv in prop_items]
+                else:
+                    seen_ids = {
+                        str((x.get("AttachmentId") or {}).get("Id") if isinstance(x.get("AttachmentId"), dict) else (x.get("AttachmentId") or x.get("Id") or x.get("Name") or id(x)))
+                        for x in result if isinstance(x, dict)
+                    }
+                    for _, pv in prop_items:
+                        pid = str((pv.get("AttachmentId") or {}).get("Id") if isinstance(pv.get("AttachmentId"), dict) else (pv.get("AttachmentId") or pv.get("Id") or pv.get("Name") or ""))
+                        if not pid or pid not in seen_ids:
+                            result.append(pv)
+                            if pid:
+                                seen_ids.add(pid)
+            return result
+        for ck in ("Items", "items", "Attachment", "attachments", "Attachments", "value"):
+            if isinstance(raw_obj.get(ck), (list, dict)):
+                return unwrap_idb_list(raw_obj[ck])
+        if any(k in raw_obj for k in ("Name", "name", "FileName", "fileName", "AttachmentId", "attachmentId", "ContentId", "contentId", "Url", "url")):
+            return [raw_obj]
+    return []
+
+
+_QUOTED_SPLIT_PATTERNS = [
+    re.compile(r'<hr\b[^>]*>\s*<div\b[^>]*id=["\'][^"\']*divRplyFwdMsg["\']', re.IGNORECASE),
+    re.compile(r'<div\b[^>]*id=["\'][^"\']*divRplyFwdMsg["\']', re.IGNORECASE),
+    re.compile(r'-{5,}\s*Original Message\s*-{5,}', re.IGNORECASE),
+    re.compile(r'_{18,}\s*(?:<br\b[^>]*>|\s|</p>|</div>|<div[^>]*>|<p[^>]*>|<span[^>]*>|<font[^>]*>)*(?:<b>\s*)?From:\s*', re.IGNORECASE),
+    re.compile(r'<div\b[^>]*class=["\'][^"\']*gmail_quote["\']', re.IGNORECASE),
+    re.compile(r'<blockquote\b[^>]*type=["\']cite["\']', re.IGNORECASE),
+]
+
+
+def split_email_primary_and_quoted_html(html_str):
+    """
+    Splits an email HTML body into (primary_new_html, quoted_thread_history_html)
+    at the first top-level reply/forward quote boundary.
+    """
+    if not html_str:
+        return "", ""
+    earliest_pos = None
+    for rx in _QUOTED_SPLIT_PATTERNS:
+        m = rx.search(html_str)
+        if m and m.start() >= 20:
+            if earliest_pos is None or m.start() < earliest_pos:
+                earliest_pos = m.start()
+    if earliest_pos is not None:
+        return html_str[:earliest_pos], html_str[earliest_pos:]
+    return html_str, ""
+
+
+_SIGNATURE_ICON_NAMES = {
+    "fb", "in", "tw", "ig", "yt", "facebook", "linkedin", "twitter",
+    "instagram", "youtube", "logo", "company logo", "banner", "icon",
+    "outlook", "teams", "skype", "whatsapp", "web", "website", "phone",
+    "mail", "email", "address", "location", "globe", "spacer", "divider"
+}
+
+_INLINE_LOGO_FILENAME_RX = re.compile(
+    r'^(?:image\d{1,4}\.(?:png|jpe?g|gif|bmp)|outlook-[a-z0-9_\-]+\.(?:png|jpe?g|gif)|signature_[a-z0-9_\-]+|inline_image.*|.*(?:logo|banner|icon|social|badge|footer|header|spacer|pixel|tracking).*\.(?:png|jpe?g|gif|svg))$',
+    re.IGNORECASE
+)
+
+
+def is_inline_or_logo_attachment(name, is_inline=False, cid="", body_html=""):
+    """
+    Returns True if an attachment entry is an inline/embedded email image, signature logo,
+    or decorative icon rather than a file explicitly attached via 'Attach File'.
+    """
+    if is_inline:
+        return True
+    clean_cid = str(cid or "").strip().strip("<>").lower()
+    if clean_cid and body_html:
+        bl = body_html.lower()
+        if f"cid:{clean_cid}" in bl or f"cid:{clean_cid.split('@')[0]}" in bl:
+            return True
+    fn = str(name or "").strip()
+    fn_l = fn.lower()
+    stem = os.path.splitext(fn_l)[0]
+    if fn_l in _SIGNATURE_ICON_NAMES or stem in _SIGNATURE_ICON_NAMES:
+        return True
+    if _INLINE_LOGO_FILENAME_RX.match(fn_l):
+        return True
+    return False
+
+
+def extract_attachments_from_html_fragment(html_fragment, is_quoted=False):
+    """
+    Extracts ONLY genuine file attachments referenced in HTML:
+    - Cloud / SharePoint / OneDrive / Google Drive / S3 attached file links
+    - Explicit attached file markers ([filename.ext (mime)] or <filename.ext>)
+    Does NOT treat inline <img> / cid: logos or signature graphics as attachments.
+    """
+    if not html_fragment:
+        return []
+    found = []
+
+    # 1. Extract Cloud / SharePoint / OneDrive / Google Drive / S3 / CloudFront file attachment links
+    ext_rx = re.compile(r'\b([A-Za-z0-9_\-\. ()]{2,110}\.(?:pdf|xlsx|xls|docx|doc|csv|zip|rar|7z|pptx|ppt|msg|eml|txt|xml|png|jpg|jpeg|gif))\b', re.IGNORECASE)
+    for am in re.finditer(r'<a\b[^>]*\bhref\s*=\s*["\']([^"\']+)["\'][^>]*>(.*?)</a>', html_fragment, re.IGNORECASE | re.DOTALL):
+        href = am.group(1).replace("&amp;", "&").strip()
+        if not href or href.lower().startswith("mailto:"):
+            continue
+        real_url = href
+        if "safelinks.protection.outlook.com" in href.lower():
+            try:
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+                if qs.get("url"):
+                    real_url = qs["url"][0]
+            except Exception:
+                pass
+        inner_text = re.sub(r'<[^>]+>', ' ', am.group(2))
+        inner_text = re.sub(r'\s+', ' ', inner_text).strip()
+        if inner_text.lower() in ("open", "share", "view", "download", "click here", "link"):
+            continue
+
+        rl_lower = real_url.lower()
+        is_sp_doc = any(p in rl_lower for p in ("sharepoint.com/:w:/", "sharepoint.com/:x:/", "sharepoint.com/:b:/", "sharepoint.com/:p:/", "/shared%20documents/", "/documents/attachments/"))
+        is_gdrive_file = "drive.google.com/file/d/" in rl_lower
+        is_cloud_upload = ("cloudfront.net/uploads/" in rl_lower or "amazonaws.com/uploads/" in rl_lower)
+        has_file_ext = bool(ext_rx.fullmatch(inner_text))
+
+        if is_sp_doc or is_gdrive_file or is_cloud_upload or (has_file_ext and ("sharepoint.com" in rl_lower or "onedrive" in rl_lower or "drive.google.com" in rl_lower or "uploads/" in rl_lower)):
+            fname = inner_text
+            if not fname or fname.startswith("http"):
+                url_path = urllib.parse.unquote(urllib.parse.urlparse(real_url).path)
+                base_p = os.path.basename(url_path.rstrip("/"))
+                fname = base_p if (base_p and "." in base_p) else (inner_text or "Cloud_Attachment")
+            if is_sp_doc and not os.path.splitext(fname)[1]:
+                if "/:w:/" in rl_lower:
+                    fname += ".docx"
+                elif "/:x:/" in rl_lower:
+                    fname += ".xlsx"
+                elif "/:b:/" in rl_lower:
+                    fname += ".pdf"
+                elif "/:p:/" in rl_lower:
+                    fname += ".pptx"
+            if not fname or len(fname) < 2:
+                continue
+            found.append({
+                "Name": fname,
+                "ContentType": "",
+                "ContentId": "",
+                "AttachmentId": "",
+                "ExternalUrl": real_url,
+                "IsInline": False,
+                "FromQuoted": is_quoted,
+                "AttachmentSource": "Cloud File"
+            })
+
+    # 2. Extract explicit square-bracket [ filename.ext (mime/type) ] and angle-bracket <filename.ext> attached file markers
+    for bm in re.finditer(r'\[\s*([A-Za-z0-9_\-\. ()]{2,110}\.[a-zA-Z0-9]{2,5})\s*\(([a-zA-Z0-9\-\+/\.]+)\)\s*\]', html_fragment):
+        fn = bm.group(1).strip()
+        ct = bm.group(2).strip()
+        if not is_inline_or_logo_attachment(fn):
+            found.append({
+                "Name": fn,
+                "ContentType": ct,
+                "ContentId": "",
+                "AttachmentId": "",
+                "IsInline": False,
+                "FromQuoted": is_quoted,
+                "AttachmentSource": "Attached File"
+            })
+
+    for agm in re.finditer(r'&lt;([A-Za-z0-9_\-\. ()]{2,110}\.(?:pdf|html|htm|xlsx|xls|docx|doc|csv|zip|rar|7z|pptx|ppt|msg|eml|txt|xml))&gt;', html_fragment, re.IGNORECASE):
+        fn = agm.group(1).strip()
+        if "@" in fn or fn.lower().startswith("http") or fn.lower().endswith(".com"):
+            continue
+        found.append({
+            "Name": fn,
+            "ContentType": "",
+            "ContentId": "",
+            "AttachmentId": "",
+            "IsInline": False,
+            "FromQuoted": is_quoted,
+            "AttachmentSource": "Attached File"
+        })
+
+    return found
+
+
 def sanitize_email_html_for_viewer(raw_html, cid_map=None):
     """
     Prepares an HTML email body for lossless display inside the Outlook UI:
-    - Rewrites inline cid:... image references to extracted attachment paths
-    - Neutralizes document-level <html>/<head>/<body> tags and scopes global CSS selectors
-      so an email's stylesheet cannot break the outer Outlook viewer layout
-    - Preserves 100% of email text, formatting, tables, colors, links, and quoted history.
+    - Rewrites inline cid:... and data-imagetype="AttachmentByCid" image references to extracted attachment paths
+    - Replaces unextracted 1x1 transparent GIF spacers with clear visible inline attachment badges
+    - Neutralizes hardcoded black/white CSS rules inside <style> blocks for full Dark Mode compatibility
+    - Styles embedded quoted reply headers (From/Sent/To/Subject) for clear mail chain readability.
     """
     if not raw_html:
         return ""
     h = str(raw_html)
-    # Rewrite cid: references if cid_map is provided
-    if cid_map:
-        def replace_cid(match):
-            attr_prefix = match.group(1)
-            quote = match.group(2)
-            cid_val = match.group(3).strip()
-            clean_cid = cid_val.strip("<>").lower()
-            clean_cid_short = clean_cid.split("@")[0]
-            mapped = cid_map.get(clean_cid) or cid_map.get(clean_cid_short)
-            if mapped:
-                return f'{attr_prefix}{quote}{mapped}{quote} onclick="openImageModal(this.src)" style="cursor:zoom-in; max-width:100%;"'
-            return match.group(0)
-        h = re.sub(r'(src\s*=\s*)(["\'])cid:([^"\']+)\2', replace_cid, h, flags=re.IGNORECASE)
+    cid_map = cid_map or {}
+
+    def replace_img_tag(match):
+        tag = match.group(0)
+        tl = tag.lower()
+        osrc_m = re.search(r'\boriginalSrc\s*=\s*["\']([^"\']+)["\']', tag, re.IGNORECASE)
+        src_m = re.search(r'\bsrc\s*=\s*["\']([^"\']+)["\']', tag, re.IGNORECASE)
+        dcust_m = re.search(r'\bdata-custom\s*=\s*["\']([^"\']+)["\']', tag, re.IGNORECASE)
+        alt_m = re.search(r'\balt\s*=\s*["\']([^"\']*)["\']', tag, re.IGNORECASE)
+        title_m = re.search(r'\btitle\s*=\s*["\']([^"\']*)["\']', tag, re.IGNORECASE)
+        bsrc_m = re.search(r'\bblockedImageSrc\s*=\s*["\']([^"\']+)["\']', tag, re.IGNORECASE)
+
+        src_val = (src_m.group(1) if src_m else "").strip()
+        osrc_val = (osrc_m.group(1) if osrc_m else "").strip()
+        cid_raw = osrc_val if osrc_val.lower().startswith("cid:") else (src_val if src_val.lower().startswith("cid:") else "")
+        cid_clean = cid_raw[4:].strip().strip("<>").lower() if cid_raw.lower().startswith("cid:") else ""
+        cid_short = cid_clean.split("@")[0] if cid_clean else ""
+        att_id_raw = urllib.parse.unquote(dcust_m.group(1)).strip() if dcust_m else ""
+        title_str = (title_m.group(1) if title_m else "").strip()
+        alt_str = (alt_m.group(1) if alt_m else "").strip()
+        if "\n" in alt_str or len(alt_str) > 95:
+            alt_str = ""
+        fname_cand = (title_str or alt_str).strip()
+
+        mapped = None
+        if att_id_raw:
+            mapped = cid_map.get(att_id_raw) or cid_map.get(att_id_raw.lower())
+        if not mapped and cid_clean:
+            mapped = cid_map.get(cid_clean) or cid_map.get(cid_short)
+        if not mapped and fname_cand:
+            mapped = cid_map.get(fname_cand.lower())
+
+        is_spacer_gif = "R0lGODlhAQABAIAAAAAAAP" in src_val
+
+        if mapped:
+            new_tag = re.sub(r'\bnaturalHeight\s*=\s*["\']0["\']', '', tag, flags=re.IGNORECASE)
+            new_tag = re.sub(r'\bnaturalWidth\s*=\s*["\']0["\']', '', new_tag, flags=re.IGNORECASE)
+            if src_m:
+                new_tag = re.sub(
+                    r'\bsrc\s*=\s*(["\'])[^"\']*\1',
+                    f'src="{mapped}" onclick="openImageModal(this.src)"',
+                    new_tag,
+                    count=1,
+                    flags=re.IGNORECASE
+                )
+            else:
+                new_tag = new_tag[:-1] + f' src="{mapped}" onclick="openImageModal(this.src)">'
+            return new_tag
+
+        if is_spacer_gif or ("attachmentbycid" in tl and not src_val) or (cid_clean and not mapped):
+            # Hide unextracted signature logos / spacer GIFs cleanly instead of cluttering the email body
+            return ""
+
+        if bsrc_m and not src_val:
+            b_url = bsrc_m.group(1)
+            if "googleusercontent.com" in b_url or "onecdn.static.microsoft" in b_url:
+                return f'<span style="margin-right:4px;">📎</span>'
+            return ""
+
+        return tag
+
+    h = re.sub(r'<img\b[^>]+>', replace_img_tag, h, flags=re.IGNORECASE)
 
     # Strip <script> tags for forensic viewer safety while preserving everything else
     h = re.sub(r'<script[^>]*>.*?</script>', '', h, flags=re.DOTALL | re.IGNORECASE)
-    # Neutralize global body/html/:root/universal selectors inside <style> blocks
+
+    # Neutralize global body/html/:root selectors and dark-mode-hostile hardcoded black colors inside <style> blocks
     def scope_style_block(m):
         css = m.group(1)
         css = re.sub(r'\b(html|body|:root)\b', '.email-render-scope', css, flags=re.IGNORECASE)
+        css = re.sub(r'(?<![a-z\-])color\s*:\s*(?:rgb\(\s*0\s*,\s*0\s*,\s*0\s*\)|#000000|#000|black|windowtext)\b', 'color: inherit', css, flags=re.IGNORECASE)
         return f"<style>{css}</style>"
+
     h = re.sub(r'<style[^>]*>(.*?)</style>', scope_style_block, h, flags=re.DOTALL | re.IGNORECASE)
     # Unwrap outer <!DOCTYPE>, <html>, <head>, <body> tags while keeping their inner content
     h = re.sub(r'<!DOCTYPE[^>]*>', '', h, flags=re.IGNORECASE)
     h = re.sub(r'</?(html|head|body|meta|title)[^>]*>', '', h, flags=re.IGNORECASE)
-    return h.strip()
+    h = h.strip()
+
+    # Separate new reply content from repeated quoted thread history for clear mail chain readability
+    primary_part, quoted_part = split_email_primary_and_quoted_html(h)
+    if quoted_part and quoted_part.strip():
+        h = (
+            f'{primary_part.strip()}'
+            f'<details class="quoted-history-details">'
+            f'<summary class="quoted-history-summary" title="Show/hide quoted message">'
+            f'<span>•••</span>'
+            f'</summary>'
+            f'<div class="quoted-history-body">{quoted_part.strip()}</div>'
+            f'</details>'
+        )
+    return h
 
 def sanitize_idb_value(val):
     if val is None:
@@ -587,6 +870,13 @@ def sanitize_idb_value(val):
     cls_name = val.__class__.__name__
     if cls_name in ("Undefined", "Null", "NullType", "UndefinedType"):
         return None
+    if cls_name == "JSArray":
+        raw_vals = [sanitize_idb_value(x) for x in (getattr(val, "values", None) or [])]
+        raw_props = getattr(val, "properties", None)
+        if isinstance(raw_props, dict) and raw_props:
+            san_props = {str(k): sanitize_idb_value(v) for k, v in raw_props.items()}
+            return unwrap_idb_list({"values": raw_vals, "properties": san_props})
+        return [x for x in raw_vals if x is not None]
     if isinstance(val, (bytes, bytearray, memoryview)):
         return safe_decode_bytes(val)
     if isinstance(val, dict):
@@ -686,6 +976,9 @@ class OutlookForensicEngine:
         self.contacts_raw = []
         self.leveldb_records = []
         self.source_files_ingested = []
+        self.attachment_blob_map = {}
+        self.attachment_meta_map = {}
+        self.indexeddb_blob_files = {}
 
         # Processed & normalized collections
         self.messages_by_key = {}
@@ -819,11 +1112,17 @@ class OutlookForensicEngine:
                 log_progress(f"  Warning saving attachment {out_name}: {e}")
 
         clean_cid = str(content_id or "").strip().strip("<>")
+        ext_url = str(msg_meta.get("external_url") or "")
+        att_src = str(msg_meta.get("attachment_source") or ("Inline CID Image" if (is_inline or clean_cid) else ("Cloud / Linked File" if ext_url else "File Attachment")))
+        att_key = str(msg_meta.get("attachment_key") or "")
         att_rec = {
             "att_id": f"att_{len(self.attachments_catalog) + 1}",
             "fileName": clean_orig,
             "savedName": out_name,
-            "rel_path": f"outlook_attachments/{out_name}" if extracted else "",
+            "rel_path": f"outlook_attachments/{out_name}" if extracted else ext_url,
+            "externalUrl": ext_url,
+            "attachmentSource": att_src,
+            "attachmentKey": att_key,
             "contentType": final_mime,
             "category": category,
             "size": size_bytes,
@@ -833,6 +1132,7 @@ class OutlookForensicEngine:
             "extracted": extracted,
             "msg_id": str(msg_meta.get("msg_id") or ""),
             "chain_id": str(msg_meta.get("chain_id") or ""),
+            "chain_index": int(msg_meta.get("chain_index") or 0),
             "subject": str(msg_meta.get("subject") or ""),
             "sender": str(msg_meta.get("sender") or ""),
             "time_local": str(msg_meta.get("time_local") or ""),
@@ -929,6 +1229,7 @@ class OutlookForensicEngine:
         return safe_decode_bytes(b)
 
     def ingest_record(self, db, store, ukey, val, source_file="LevelDB"):
+        raw_version = getattr(val, "version", None) if not isinstance(val, dict) else val.get("version")
         if hasattr(val, "value"):
             val = val.value
         val = sanitize_idb_value(val)
@@ -947,6 +1248,9 @@ class OutlookForensicEngine:
         if not isinstance(val, dict):
             return
 
+        if raw_version is None and isinstance(val.get("version"), int):
+            raw_version = val.get("version")
+
         # Unwrap nested value wrapper if present (e.g. {"key": ..., "value": {...}})
         root = val
         if "value" in root and isinstance(root["value"], dict) and len(root) <= 5 and not any(k in root for k in ("Subject", "subject", "From", "from", "Body", "body")):
@@ -958,6 +1262,28 @@ class OutlookForensicEngine:
 
         if not isinstance(root, dict) or not root:
             return
+
+        # 0. Attachment Metadata Cache Record (Store 19, 1) & Attachment Image Blob Cache Record (Store 12, 1)
+        att_id_cache = str(root.get("attachmentId") or "").strip()
+        if att_id_cache and not any(k in root for k in ("Subject", "subject", "From", "from")):
+            if root.get("fileName") or root.get("fileSize") or "pendingSave" in root:
+                self.attachment_meta_map[att_id_cache] = {
+                    "attachmentId": att_id_cache,
+                    "fileName": str(root.get("fileName") or "").strip(),
+                    "fileSize": int(root.get("fileSize") or 0),
+                    "timeCached": str(root.get("timeCached") or "")
+                }
+                return
+            if "thumbnailType" in root or "image" in root or "messageBodyId" in root:
+                if raw_version and att_id_cache not in self.attachment_blob_map:
+                    self.attachment_blob_map[att_id_cache] = {
+                        "db_id": int(db) if isinstance(db, int) else 12,
+                        "blob_number": int(raw_version),
+                        "mime": "",
+                        "size": 0,
+                        "thumb": str(root.get("thumbnailType") or "")
+                    }
+                return
 
         item_class = str(root.get("ItemClass") or root.get("itemClass") or root.get("MessageClass") or root.get("messageClass") or root.get("@odata.type") or "").strip()
         ic_lower = item_class.lower()
@@ -1253,14 +1579,59 @@ class OutlookForensicEngine:
             idb_parsed_count = 0
 
             # 1. Try Chromium IndexedDB Decoder (for *.indexeddb.leveldb tables)
-            if ChromiumRecord is not None:
+            if ChromiumRecord is not None and LevelDBRecord is not None:
                 try:
-                    for rec in ChromiumRecord.FromFile(pathlib.Path(fp)):
-                        db_id = getattr(rec, "database_id", None) or (rec.get("database_id") if isinstance(rec, dict) else None)
-                        store_id = getattr(rec, "object_store_id", None) or (rec.get("object_store_id") if isinstance(rec, dict) else None)
-                        val = getattr(rec, "value", None) or (rec.get("value") if isinstance(rec, dict) else None)
-                        key_obj = getattr(rec, "key", None) or (rec.get("key") if isinstance(rec, dict) else None)
+                    for db_rec in LevelDBRecord.FromFile(pathlib.Path(fp)):
+                        try:
+                            raw_k = getattr(db_rec.record, "key", b"")
+                            if not raw_k:
+                                continue
+                            b0 = raw_k[0]
+                            db_len = ((b0 & 0xE0) >> 5) + 1
+                            st_len = ((b0 & 0x1C) >> 2) + 1
+                            ix_len = (b0 & 0x03) + 1
+                            hdr_len = 1 + db_len + st_len + ix_len
+                            if len(raw_k) >= hdr_len:
+                                db_q = int.from_bytes(raw_k[1 : 1 + db_len], "little")
+                                st_q = int.from_bytes(raw_k[1 + db_len : 1 + db_len + st_len], "little")
+                                ix_q = int.from_bytes(raw_k[1 + db_len + st_len : hdr_len], "little")
+                                if db_q != 0 and st_q != 0 and (ix_q == 2 or ix_q >= 30):
+                                    idb_parsed_count += 1
+                                    continue
+                            rec = ChromiumRecord.FromLevelDBRecord(db_rec)
+                        except Exception:
+                            continue
+
+                        db_id = getattr(rec, "database_id", None)
+                        store_id = getattr(rec, "object_store_id", None)
+                        val = getattr(rec, "value", None)
+                        key_obj = getattr(rec, "key", None)
                         seq_no = getattr(rec, "sequence_number", 0)
+                        k_cls = key_obj.__class__.__name__ if key_obj else ""
+
+                        if k_cls == "BlobEntryKey" and val is not None:
+                            idb_parsed_count += 1
+                            uk = getattr(key_obj, "user_key", None)
+                            uk_val = getattr(uk, "value", None) if uk else None
+                            entries = getattr(val, "entries", None)
+                            if db_id == 12 and isinstance(uk_val, (list, tuple)) and len(uk_val) >= 1 and entries:
+                                aid = str(uk_val[0]).strip()
+                                tt = str(uk_val[1]) if len(uk_val) > 1 else ""
+                                bnum = getattr(entries[0], "blob_number", None)
+                                mime = str(getattr(entries[0], "mime_type", "") or "")
+                                sz = int(getattr(entries[0], "size", 0) or 0)
+                                if aid and bnum is not None:
+                                    prev = self.attachment_blob_map.get(aid)
+                                    if not prev or tt == "2" or sz >= prev.get("size", 0):
+                                        self.attachment_blob_map[aid] = {
+                                            "db_id": int(db_id),
+                                            "blob_number": int(bnum),
+                                            "mime": mime,
+                                            "size": sz,
+                                            "thumb": tt
+                                        }
+                            continue
+
                         ukey = None
                         if key_obj:
                             enc = getattr(key_obj, "encoded_user_key", None) or (key_obj.get("encoded_user_key") if isinstance(key_obj, dict) else None)
@@ -1274,7 +1645,7 @@ class OutlookForensicEngine:
                         if val is not None:
                             idb_parsed_count += 1
                             self.ingest_record(db_id, store_id, ukey, val, source_file=f"{tbl_name}/{fname}")
-                            if len(self.leveldb_records) < 2500:
+                            if len(self.leveldb_records) < 2500 and k_cls == "ObjectStoreDataKey":
                                 san_v = sanitize_idb_value(val)
                                 try:
                                     v_str = json.dumps(san_v, ensure_ascii=False)[:1500]
@@ -1292,9 +1663,9 @@ class OutlookForensicEngine:
                 except Exception:
                     pass
 
-            # 2. Also run Raw LevelDB Record Reader (for Local Storage, Session Storage, Sync Data, or raw JSON-in-LevelDB tables)
+            # 2. Also run Raw LevelDB Record Reader (only for non-IndexedDB tables like Local Storage, Session Storage, Sync Data)
             raw_ldb_count = 0
-            if LevelDBRecord is not None:
+            if idb_parsed_count == 0 and LevelDBRecord is not None:
                 try:
                     for rec_wrapper in LevelDBRecord.FromFile(pathlib.Path(fp)):
                         inner = getattr(rec_wrapper, "record", rec_wrapper)
@@ -2377,6 +2748,47 @@ class OutlookForensicEngine:
         if leveldb_dirs or standalone_ldb_files:
             self.ingest_leveldb_files(leveldb_dirs, standalone_ldb_files)
 
+        # Scan any .indexeddb.blob directories to index binary blobs and decode external V8 (>64KB) message records
+        blob_dirs = []
+        for root, dirs, files in os.walk(self.target_path):
+            if os.path.basename(root.lower()).endswith(".indexeddb.blob"):
+                blob_dirs.append(root)
+
+        if blob_dirs:
+            init_native_indexeddb_engine()
+            blink_mod = sys.modules.get("dfindexeddb.indexeddb.chromium.blink")
+            v8_decoder = getattr(blink_mod, "V8ScriptValueDecoder", None) if blink_mod else None
+            v8_msg_blobs = 0
+            for b_dir in blob_dirs:
+                for root, dirs, files in os.walk(b_dir):
+                    for f in sorted(files):
+                        if f.startswith("$") or f.endswith(".tmp"):
+                            continue
+                        fp = os.path.join(root, f)
+                        try:
+                            fsize = os.path.getsize(fp)
+                            if fsize <= 0 or fsize > 100 * 1024 * 1024:
+                                continue
+                            rel_parts = os.path.relpath(fp, b_dir).replace("\\", "/").split("/")
+                            db_hx = rel_parts[0].lower() if len(rel_parts) >= 2 else ""
+                            bl_hx = f.lower()
+                            self.indexeddb_blob_files[(db_hx, bl_hx)] = fp
+                            self.indexeddb_blob_files[("*", bl_hx)] = fp
+
+                            # Decode external V8-serialized IndexedDB objects (e.g. DB 3 large >64KB Message:#Exchange records)
+                            if db_hx == "3" and v8_decoder is not None:
+                                with open(fp, "rb") as bf:
+                                    head = bf.read(4)
+                                    if head.startswith(b"\xff"):
+                                        raw_b = head + bf.read()
+                                        bval = v8_decoder.FromBytes(raw_b)
+                                        self.ingest_record(3, 11, f, bval, source_file=f"IndexedDB.Blob/3/{f}")
+                                        v8_msg_blobs += 1
+                        except Exception:
+                            continue
+            if v8_msg_blobs:
+                log_progress(f"  Decoded {v8_msg_blobs} large external V8 message blobs from .indexeddb.blob/3/...")
+
         for pf in pff_files:
             self.parse_pff_file(pf)
 
@@ -2466,6 +2878,7 @@ class OutlookForensicEngine:
         """Extracts both HTML body and Plain Text body from any EWS/OWA/Graph/MAPI message schema."""
         html_candidates = []
         plain_candidates = []
+        preview_candidates = []
 
         for k in ("body_html", "BodyHtml", "htmlBody", "HtmlBody"):
             v = raw_msg.get(k)
@@ -2496,18 +2909,50 @@ class OutlookForensicEngine:
         for k in ("BodyPreview", "bodyPreview", "Preview", "preview"):
             pv = raw_msg.get(k)
             if pv and isinstance(pv, str) and pv.strip():
-                plain_candidates.append(pv)
+                preview_candidates.append(pv)
 
         best_html = max(html_candidates, key=len) if html_candidates else ""
         best_plain = max(plain_candidates, key=len) if plain_candidates else ""
+        best_preview = max(preview_candidates, key=len) if preview_candidates else ""
 
         if best_html and not best_plain:
             best_plain = html_to_plain_text(best_html)
+        if best_preview and len(best_preview) > len(best_plain):
+            best_plain = best_preview
 
         return best_html, best_plain
 
+    def resolve_blob_bytes_for_attachment(self, att_key):
+        """Looks up an Exchange/IndexedDB attachmentId in Store (12, 1) blob map and returns (raw_bytes, mime, size)."""
+        if not att_key:
+            return None, "", 0
+        binfo = self.attachment_blob_map.get(att_key)
+        if not binfo:
+            return None, "", 0
+        db_hx = f"{int(binfo.get('db_id') or 12):x}".lower()
+        bl_hx = f"{int(binfo.get('blob_number') or 0):x}".lower()
+        fp = self.indexeddb_blob_files.get((db_hx, bl_hx)) or self.indexeddb_blob_files.get(("*", bl_hx))
+        if fp and os.path.exists(fp):
+            try:
+                with open(fp, "rb") as bf:
+                    raw_b = bf.read()
+                if raw_b:
+                    return raw_b, str(binfo.get("mime") or ""), len(raw_b)
+            except Exception:
+                pass
+        return None, str(binfo.get("mime") or ""), int(binfo.get("size") or 0)
+
     def process_messages(self):
-        """Normalizes and deduplicates all ingested email messages and extracts embedded attachments."""
+        """Normalizes and deduplicates all ingested email messages (merging preview & full records by msg_id and internet_message_id)."""
+        by_msg_id = {}
+        by_inet_id = {}
+        ordered_unique_messages = []
+
+        def recipient_list_score(rlist):
+            if not rlist:
+                return 0
+            return sum(3 if ("@" in str(r.get("email", ""))) else 1 for r in rlist)
+
         for idx, m in enumerate(self.messages_raw):
             if not isinstance(m, dict):
                 continue
@@ -2669,30 +3114,66 @@ class OutlookForensicEngine:
             is_deleted = bool(m.get("IsDeleted") or m.get("isDeleted") or m.get("deletetime") or folder_name in ("Deleted Items", "[Recovered Orphan Items]"))
             importance = str(m.get("Importance") or m.get("importance") or "Normal").capitalize()
             sensitivity = str(m.get("Sensitivity") or m.get("sensitivity") or "Normal").capitalize()
-            categories = m.get("Categories") or m.get("categories") or []
-            if isinstance(categories, str):
-                categories = [c.strip() for c in categories.split(";") if c.strip()]
+            categories = unwrap_idb_list(m.get("Categories") or m.get("categories") or [])
+            if isinstance(m.get("Categories") or m.get("categories"), str):
+                categories = [c.strip() for c in str(m.get("Categories") or m.get("categories")).split(";") if c.strip()]
             item_class = str(m.get("ItemClass") or m.get("itemClass") or m.get("MessageClass") or "IPM.Note")
             source_file = str(m.get("_source_file") or "Outlook Evidence")
+            unwrapped_atts = unwrap_idb_list(m.get("Attachments") or m.get("attachments") or [])
+            doc_links = unwrap_idb_list(m.get("DocLinks") or m.get("docLinks") or [])
+            if doc_links:
+                unwrapped_atts.extend(doc_links)
 
-            # 9. Deduplication Check (merge if same message ID in same folder was updated in LevelDB)
-            dedup_key = (canonical_inet_id or msg_id, folder_name)
-            if dedup_key in self.messages_by_key:
-                existing = self.messages_by_key[dedup_key]
+            # 9. Dual-Key Deduplication (matches by msg_id OR canonical_inet_id so Store (3,9) preview and Store (3,11) full record merge)
+            existing = (
+                by_msg_id.get((msg_id, folder_name))
+                or by_msg_id.get(msg_id)
+                or (by_inet_id.get((canonical_inet_id, folder_name)) if canonical_inet_id else None)
+            )
+            if existing is not None:
                 if len(body_html) > len(existing["body_html"]):
                     existing["body_html"] = body_html
+                    existing["source_file"] = source_file
                 if len(body_plain) > len(existing["body_plain"]):
                     existing["body_plain"] = body_plain
+                if existing["body_html"] and len(existing["body_plain"]) <= 300:
+                    full_p = html_to_plain_text(existing["body_html"])
+                    if len(full_p) > len(existing["body_plain"]):
+                        existing["body_plain"] = full_p
                 if is_deleted:
                     existing["is_deleted"] = True
                 if not existing["time_utc"] and time_utc:
                     existing["time_utc"] = time_utc
                     existing["time_local"] = time_local
                     existing["time_sort"] = time_sort
-                if not existing["to_recipients"] and to_list:
+                if not existing["canonical_inet_id"] and canonical_inet_id:
+                    existing["canonical_inet_id"] = canonical_inet_id
+                    existing["internet_message_id"] = inet_msg_id or f"<{canonical_inet_id}>"
+                    by_inet_id[(canonical_inet_id, existing["folder"])] = existing
+                if not existing["in_reply_to"] and in_reply_to:
+                    existing["in_reply_to"] = in_reply_to
+                    existing["canonical_reply_to"] = canonical_reply_to
+                if not existing["references"] and refs_str:
+                    existing["references"] = refs_str
+                    existing["references_list"] = refs_tokens
+                if not existing["conversation_id"] and conv_id:
+                    existing["conversation_id"] = conv_id
+                if not existing["conversation_index"] and conv_idx_info["hex"]:
+                    existing["conversation_index"] = conv_idx_info["hex"]
+                    existing["conv_index_guid"] = conv_idx_info["thread_guid"]
+                    existing["conv_index_depth"] = conv_idx_info["reply_depth"]
+                if "@" in sender_email and "@" not in existing["sender_email"]:
+                    existing["sender_name"] = sender_name
+                    existing["sender_email"] = sender_email
+                    existing["sender_display"] = sender_display
+                if recipient_list_score(to_list) > recipient_list_score(existing["to_recipients"]):
                     existing["to_recipients"] = to_list
-                if not existing["raw_attachments"] and (m.get("Attachments") or m.get("attachments")):
-                    existing["raw_attachments"] = m.get("Attachments") or m.get("attachments") or []
+                if recipient_list_score(cc_list) > recipient_list_score(existing["cc_recipients"]):
+                    existing["cc_recipients"] = cc_list
+                if recipient_list_score(bcc_list) > recipient_list_score(existing["bcc_recipients"]):
+                    existing["bcc_recipients"] = bcc_list
+                if unwrapped_atts:
+                    existing["raw_attachments"].extend(unwrapped_atts)
                 continue
 
             msg_record = {
@@ -2738,71 +3219,38 @@ class OutlookForensicEngine:
                 "transport_headers": raw_hdrs_str,
                 "parsed_headers": parsed_hdrs,
                 "mapi_properties": m.get("MapiProperties") or {},
-                "raw_attachments": m.get("Attachments") or m.get("attachments") or [],
+                "raw_attachments": list(unwrapped_atts),
                 "attachments": [],
                 "source_file": source_file
             }
-            self.messages_by_key[dedup_key] = msg_record
+            by_msg_id[(msg_id, folder_name)] = msg_record
+            if not msg_id.startswith("msg_"):
+                by_msg_id[msg_id] = msg_record
+            if canonical_inet_id:
+                by_inet_id[(canonical_inet_id, folder_name)] = msg_record
+            ordered_unique_messages.append(msg_record)
 
-        self.all_messages_list = list(self.messages_by_key.values())
+        self.all_messages_list = ordered_unique_messages
+        self.messages_by_key = by_msg_id
 
-        # Now process attachments for each deduplicated message
+        # Map Store (19, 1) attachment metadata records to their parent message IDs (prefix before 'ARIAEA')
+        store19_by_msgid = defaultdict(list)
+        for aid, minfo in self.attachment_meta_map.items():
+            if "ARIAEA" in aid:
+                parent_mid = aid.split("ARIAEA")[0]
+                store19_by_msgid[parent_mid].append(minfo)
+
+        # Update contact sent/received counters & attach Store (19, 1) metadata to messages
         for msg in self.all_messages_list:
-            raw_atts = msg.pop("raw_attachments", [])
-            if isinstance(raw_atts, str):
-                try:
-                    raw_atts = json.loads(raw_atts)
-                except Exception:
-                    raw_atts = []
-            if not isinstance(raw_atts, list):
-                raw_atts = []
+            if msg["id"] in store19_by_msgid:
+                for minfo in store19_by_msgid[msg["id"]]:
+                    msg["raw_attachments"].append({
+                        "AttachmentId": minfo["attachmentId"],
+                        "Name": minfo.get("fileName") or "attachment",
+                        "Size": minfo.get("fileSize") or 0,
+                        "IsInline": False
+                    })
 
-            msg_meta = {
-                "msg_id": msg["id"],
-                "subject": msg["subject"],
-                "sender": msg["sender_display"],
-                "time_local": msg["time_local"],
-                "folder": msg["folder"],
-                "source_file": msg["source_file"]
-            }
-
-            for a_item in raw_atts:
-                if not isinstance(a_item, dict):
-                    continue
-                a_name = (
-                    a_item.get("Name") or a_item.get("name")
-                    or a_item.get("FileName") or a_item.get("fileName")
-                    or a_item.get("DisplayName") or a_item.get("displayName")
-                    or "attachment"
-                )
-                a_ctype = a_item.get("ContentType") or a_item.get("contentType") or ""
-                a_cid = a_item.get("ContentId") or a_item.get("contentId") or a_item.get("cid") or ""
-                a_inline = bool(a_item.get("IsInline") or a_item.get("isInline") or a_cid)
-                a_size = int(a_item.get("Size") or a_item.get("size") or 0)
-                msg_meta["declared_size"] = a_size
-
-                a_bytes = a_item.get("_raw_bytes")
-                if a_bytes is None:
-                    b64_str = a_item.get("ContentBytes") or a_item.get("contentBytes") or a_item.get("data") or a_item.get("base64")
-                    if isinstance(b64_str, str) and b64_str.strip():
-                        try:
-                            a_bytes = base64.b64decode(b64_str)
-                        except Exception:
-                            a_bytes = b64_str.encode("utf-8", errors="replace")
-                    elif isinstance(b64_str, (bytes, bytearray)):
-                        a_bytes = bytes(b64_str)
-
-                att_rec = self.save_attachment_bytes(
-                    orig_filename=a_name,
-                    data_bytes=a_bytes,
-                    content_type=a_ctype,
-                    content_id=a_cid,
-                    is_inline=a_inline,
-                    msg_meta=msg_meta
-                )
-                msg["attachments"].append(att_rec)
-
-            # Update contact sent/received counters & auto-discover contacts from emails
             s_email = msg["sender_email"]
             s_name = msg["sender_name"]
             if s_email or (s_name and s_name != "Unknown Sender"):
@@ -2844,7 +3292,6 @@ class OutlookForensicEngine:
 
         # Determine primary user if not yet resolved from UserSettings.json
         if self.primary_user == "Outlook Account":
-            # Check sender of Sent Items first
             sent_senders = Counter()
             all_participants = Counter()
             for msg in self.all_messages_list:
@@ -2866,82 +3313,226 @@ class OutlookForensicEngine:
             if self.primary_email and "@" in self.primary_email:
                 self.primary_tenant = self.primary_email.split("@")[-1].split(".")[0].upper()
 
-        log_progress(f"  Normalized {len(self.all_messages_list)} unique email messages and {len(self.attachments_catalog)} direct attachments.")
+        log_progress(f"  Normalized {len(self.all_messages_list)} unique email messages.")
 
     def extract_cached_media_and_link_cids(self):
         """
-        1. Scans any IndexedDB .indexeddb.blob folders or WebView2 Cache_Data folders inside self.target_path
-           for cached attachments/images.
-        2. Links unextracted attachment references by filename.
-        3. Rewrites inline cid:... image references in HTML bodies to local extracted attachment paths.
+        Ensures any .indexeddb.blob directories are indexed in self.indexeddb_blob_files
+        so build_mail_chains() can link every email's attachments to their exact binary blobs and CIDs.
         """
-        if os.path.isdir(self.target_path):
-            blob_dirs = []
+        if os.path.isdir(self.target_path) and not self.indexeddb_blob_files:
             for root, dirs, files in os.walk(self.target_path):
-                rl = root.lower()
-                bl = os.path.basename(rl)
-                if bl.endswith(".indexeddb.blob"):
-                    blob_dirs.append(root)
-
-            for b_dir in blob_dirs:
-                for root, dirs, files in os.walk(b_dir):
-                    for f in files:
-                        if f.startswith("$") or f.endswith(".tmp"):
-                            continue
-                        fp = os.path.join(root, f)
-                        try:
-                            if os.path.getsize(fp) < 64 or os.path.getsize(fp) > 100 * 1024 * 1024:
+                if os.path.basename(root.lower()).endswith(".indexeddb.blob"):
+                    for r2, d2, f2 in os.walk(root):
+                        for f in sorted(f2):
+                            if f.startswith("$") or f.endswith(".tmp"):
                                 continue
-                            with open(fp, "rb") as bf:
-                                raw_b = bf.read()
-                            det_mime, det_ext, cat = self.detect_mime_and_ext(raw_b, f)
-                            if det_mime != "application/octet-stream":
-                                rel_sub = os.path.relpath(fp, b_dir).replace("\\", "_").replace("/", "_")
-                                self.save_attachment_bytes(
-                                    orig_filename=f"IndexedDB_Blob_{rel_sub}{det_ext}",
-                                    data_bytes=raw_b,
-                                    content_type=det_mime,
-                                    is_inline=False,
-                                    msg_meta={"source_file": "IndexedDB.Blob"}
-                                )
-                        except Exception:
-                            continue
+                            fp = os.path.join(r2, f)
+                            try:
+                                if 0 < os.path.getsize(fp) <= 100 * 1024 * 1024:
+                                    rel_parts = os.path.relpath(fp, root).replace("\\", "/").split("/")
+                                    db_hx = rel_parts[0].lower() if len(rel_parts) >= 2 else ""
+                                    self.indexeddb_blob_files[(db_hx, f.lower())] = fp
+                                    self.indexeddb_blob_files[("*", f.lower())] = fp
+                            except Exception:
+                                continue
 
-        # Build global attachment lookup by filename and contentId
-        by_cid = {}
-        by_name = {}
-        for att in self.attachments_catalog:
-            if att.get("extracted") and att.get("rel_path"):
-                if att.get("contentId"):
-                    cid_clean = att["contentId"].strip("<>").lower()
-                    by_cid[cid_clean] = att["rel_path"]
-                    by_cid[cid_clean.split("@")[0]] = att["rel_path"]
-                if att.get("fileName"):
-                    fn_clean = att["fileName"].strip().lower()
-                    by_name[fn_clean] = att["rel_path"]
+    def finalize_message_attachments_in_chain(self, msg, chain_id, chain_index, seen_chain_att_keys):
+        """
+        Resolves and deduplicates all attachments for a specific message within a mail chain:
+        1. Direct message attachments (Store (3,11) Attachments, Store (19,1), MAPI, EWS, MSG, EML)
+        2. Primary body HTML attachments (inline CID images, SharePoint/OneDrive/GoogleDrive/S3 cloud file links)
+        3. Quoted body attachments that have not already appeared in an earlier message of the same chain.
+        Links binary payloads from Store (12, 1) .indexeddb.blob files and rewrites inline CID tags in body_html_clean.
+        """
+        raw_atts = unwrap_idb_list(msg.pop("raw_attachments", []))
+        primary_html, quoted_html = split_email_primary_and_quoted_html(msg.get("body_html") or "")
+        html_primary_atts = extract_attachments_from_html_fragment(primary_html, is_quoted=False)
+        html_quoted_atts = extract_attachments_from_html_fragment(quoted_html, is_quoted=True)
 
-        # Link unextracted metadata-only attachments if a matching file was extracted, and sanitize HTML bodies
-        for msg in self.all_messages_list:
-            local_cid_map = dict(by_cid)
-            for att in msg.get("attachments", []):
-                if not att.get("extracted") and att.get("fileName"):
-                    fn_lower = att["fileName"].strip().lower()
-                    if fn_lower in by_name:
-                        att["rel_path"] = by_name[fn_lower]
-                        att["extracted"] = True
-                if att.get("rel_path"):
-                    if att.get("contentId"):
-                        c_id = att["contentId"].strip("<>").lower()
-                        local_cid_map[c_id] = att["rel_path"]
-                        local_cid_map[c_id.split("@")[0]] = att["rel_path"]
-                    if att.get("fileName"):
-                        fn_l = att["fileName"].strip().lower()
-                        local_cid_map[fn_l] = att["rel_path"]
+        # Build lookup of alt/title filenames by attachmentId / contentId from body_html
+        html_name_by_att_id = {}
+        html_name_by_cid = {}
+        for ha in (html_primary_atts + html_quoted_atts):
+            h_name = (ha.get("Name") or "").strip()
+            if h_name and not h_name.startswith("Inline_Image_"):
+                if ha.get("AttachmentId"):
+                    html_name_by_att_id[ha["AttachmentId"]] = h_name
+                if ha.get("ContentId"):
+                    html_name_by_cid[ha["ContentId"].lower()] = h_name
+                    html_name_by_cid[ha["ContentId"].lower().split("@")[0]] = h_name
 
-            if msg["body_html"]:
-                msg["body_html_clean"] = sanitize_email_html_for_viewer(msg["body_html"], cid_map=local_cid_map)
+        combined_candidates = []
+        for a_item in raw_atts:
+            if isinstance(a_item, dict):
+                item_copy = dict(a_item)
+                item_copy["FromQuoted"] = False
+                combined_candidates.append(item_copy)
+        combined_candidates.extend(html_primary_atts)
+        combined_candidates.extend(html_quoted_atts)
+
+        msg_meta = {
+            "msg_id": msg["id"],
+            "chain_id": chain_id,
+            "chain_index": chain_index,
+            "subject": msg["subject"],
+            "sender": msg["sender_display"],
+            "time_local": msg["time_local"],
+            "folder": msg["folder"],
+            "source_file": msg["source_file"]
+        }
+
+        seen_on_this_msg = set()
+        local_cid_map = {}
+        body_html_full = msg.get("body_html") or ""
+
+        for a_item in combined_candidates:
+            if not isinstance(a_item, dict):
+                continue
+
+            att_id_obj = a_item.get("AttachmentId") or a_item.get("attachmentId") or ""
+            if isinstance(att_id_obj, dict):
+                att_key = str(att_id_obj.get("Id") or att_id_obj.get("id") or "").strip()
             else:
-                msg["body_html_clean"] = ""
+                att_key = str(att_id_obj or "").strip()
+
+            a_cid = str(a_item.get("ContentId") or a_item.get("contentId") or a_item.get("cid") or "").strip().strip("<>")
+            ext_url = str(a_item.get("ExternalUrl") or a_item.get("ContentLocation") or a_item.get("ReferenceUrl") or a_item.get("Url") or a_item.get("url") or "").strip()
+            if ext_url and not ext_url.lower().startswith(("http://", "https://")):
+                ext_url = ""
+
+            a_name = str(
+                a_item.get("Name") or a_item.get("name")
+                or a_item.get("FileName") or a_item.get("fileName")
+                or a_item.get("DisplayName") or a_item.get("displayName")
+                or ""
+            ).strip()
+
+            # Enrich filename from Store (19, 1) if generic
+            if att_key and att_key in self.attachment_meta_map and self.attachment_meta_map[att_key].get("fileName"):
+                s19_name = self.attachment_meta_map[att_key]["fileName"]
+                if not a_name or a_name == "attachment" or "." not in a_name:
+                    a_name = s19_name
+            if not a_name:
+                a_name = "attachment"
+
+            a_ctype = str(a_item.get("ContentType") or a_item.get("contentType") or "").strip()
+            a_inline_flag = bool(a_item.get("IsInline") or a_item.get("isInline"))
+            a_size = int(a_item.get("Size") or a_item.get("size") or 0)
+            from_quoted = bool(a_item.get("FromQuoted"))
+
+            # Resolve binary payload bytes first (needed for both real attachments and inline CID image rendering)
+            a_bytes = a_item.get("_raw_bytes")
+            if a_bytes is None:
+                b64_str = a_item.get("ContentBytes") or a_item.get("contentBytes") or a_item.get("data") or a_item.get("base64")
+                if isinstance(b64_str, str) and b64_str.strip():
+                    try:
+                        a_bytes = base64.b64decode(b64_str)
+                    except Exception:
+                        a_bytes = b64_str.encode("utf-8", errors="replace")
+                elif isinstance(b64_str, (bytes, bytearray)):
+                    a_bytes = bytes(b64_str)
+
+            if a_bytes is None and att_key:
+                blob_bytes, blob_mime, blob_sz = self.resolve_blob_bytes_for_attachment(att_key)
+                if blob_bytes is not None:
+                    a_bytes = blob_bytes
+                if not a_ctype and blob_mime:
+                    a_ctype = blob_mime
+                if not a_size and blob_sz:
+                    a_size = blob_sz
+
+            # Check if this is an inline CID image / signature logo rather than a real file attachment
+            is_inline_or_logo = is_inline_or_logo_attachment(a_name, is_inline=a_inline_flag, cid=a_cid, body_html=body_html_full)
+            if is_inline_or_logo and not ext_url:
+                # Still save binary inline images for HTML cid: rendering, but DO NOT list logos/inline images as attachments!
+                if a_bytes:
+                    saved_inline = self.save_attachment_bytes(
+                        orig_filename=a_name,
+                        data_bytes=a_bytes,
+                        content_type=a_ctype,
+                        content_id=a_cid,
+                        is_inline=True,
+                        msg_meta={**msg_meta, "attachment_key": att_key, "attachment_source": "Inline Image"}
+                    )
+                    self.attachments_catalog.pop()
+                    rpath = saved_inline.get("rel_path") or ""
+                    if rpath:
+                        if att_key:
+                            local_cid_map[att_key] = rpath
+                            local_cid_map[att_key.lower()] = rpath
+                        if a_cid:
+                            local_cid_map[a_cid.lower()] = rpath
+                            local_cid_map[a_cid.lower().split("@")[0]] = rpath
+                        local_cid_map[a_name.lower()] = rpath
+                continue
+
+            # Build deduplication tokens for real attached files
+            norm_fn = a_name.strip().lower()
+            norm_url = ext_url.lower().split("?")[0] if ext_url else ""
+
+            dedup_tokens = set()
+            if att_key:
+                dedup_tokens.add(f"key:{att_key}")
+            if norm_url:
+                dedup_tokens.add(f"url:{norm_url}")
+            if norm_fn and norm_fn != "attachment":
+                dedup_tokens.add(f"fn:{norm_fn}")
+
+            if dedup_tokens and any(t in seen_on_this_msg for t in dedup_tokens):
+                continue
+
+            chain_match_tokens = {t for t in dedup_tokens if not t.startswith("key:")}
+            if from_quoted and chain_index > 1 and chain_match_tokens and any(t in seen_chain_att_keys for t in chain_match_tokens):
+                continue
+
+            seen_on_this_msg.update(dedup_tokens)
+            seen_chain_att_keys.update(chain_match_tokens)
+
+            if not a_size and att_key and att_key in self.attachment_meta_map:
+                a_size = int(self.attachment_meta_map[att_key].get("fileSize") or 0)
+
+            msg_meta["declared_size"] = a_size
+            msg_meta["external_url"] = ext_url
+            msg_meta["attachment_key"] = att_key
+            msg_meta["attachment_source"] = str(
+                a_item.get("AttachmentSource")
+                or ("Cloud File" if ext_url else "Attached File")
+            )
+
+            att_rec = self.save_attachment_bytes(
+                orig_filename=a_name,
+                data_bytes=a_bytes,
+                content_type=a_ctype,
+                content_id="",
+                is_inline=False,
+                msg_meta=msg_meta
+            )
+            msg["attachments"].append(att_rec)
+
+        # Map any extracted inline images in Store (12, 1) referenced via data-custom in body_html so they render inline
+        if body_html_full:
+            for dc_m in re.finditer(r'\bdata-custom\s*=\s*["\']([^"\']+)["\']', body_html_full, re.IGNORECASE):
+                dc_aid = urllib.parse.unquote(dc_m.group(1)).strip()
+                if dc_aid and dc_aid not in local_cid_map and dc_aid in self.attachment_blob_map:
+                    b_bytes, b_mime, _ = self.resolve_blob_bytes_for_attachment(dc_aid)
+                    if b_bytes:
+                        s_name = self.attachment_meta_map.get(dc_aid, {}).get("fileName") or f"inline_{dc_aid[-12:]}.jpg"
+                        saved_inline = self.save_attachment_bytes(
+                            orig_filename=s_name,
+                            data_bytes=b_bytes,
+                            content_type=b_mime,
+                            is_inline=True,
+                            msg_meta={**msg_meta, "attachment_key": dc_aid, "attachment_source": "Inline Image"}
+                        )
+                        self.attachments_catalog.pop()
+                        if saved_inline.get("rel_path"):
+                            local_cid_map[dc_aid] = saved_inline["rel_path"]
+                            local_cid_map[dc_aid.lower()] = saved_inline["rel_path"]
+
+            msg["body_html_clean"] = sanitize_email_html_for_viewer(body_html_full, cid_map=local_cid_map)
+        else:
+            msg["body_html_clean"] = ""
 
     def build_mail_chains(self):
         """
@@ -3096,6 +3687,7 @@ class OutlookForensicEngine:
             seen_senders = set()
             folders_ordered = []
             chain_attachments = []
+            seen_chain_att_keys = set()
             has_unread = False
             has_deleted = False
             has_draft = False
@@ -3129,9 +3721,13 @@ class OutlookForensicEngine:
                 m["parent_msg_id"] = parent_id
                 m["reply_depth"] = min(depth, 6)
 
-                # Update attachment chain_id
+                # Finalize & extract all attachments belonging to this message in the mail chain
+                self.finalize_message_attachments_in_chain(m, chain_id, pos + 1, seen_chain_att_keys)
+
+                # Update attachment chain_id and chain_index
                 for att in m.get("attachments", []):
                     att["chain_id"] = chain_id
+                    att["chain_index"] = pos + 1
                     chain_attachments.append(att)
 
                 # Collect senders & participants
@@ -3349,9 +3945,9 @@ class OutlookForensicEngine:
         with open(os.path.join(self.output_dir, "Outlook_Attachments_Catalog.csv"), "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(f, fieldnames=[
                 "att_id", "fileName", "savedName", "category", "contentType", "size", "sha256",
-                "isInline", "contentId", "extracted", "rel_path", "chain_id", "msg_id",
+                "isInline", "contentId", "extracted", "rel_path", "chain_id", "chain_index", "msg_id",
                 "subject", "sender", "time_local", "folder", "source_file"
-            ])
+            ], extrasaction="ignore")
             writer.writeheader()
             for att in self.attachments_catalog:
                 writer.writerow(att)
@@ -3535,6 +4131,7 @@ VIEWER_TEMPLATE_HTML = r"""<!DOCTYPE html>
 }
 
 [data-theme="dark"] {
+  color-scheme: dark;
   --primary: #479ef5;
   --primary-hover: #62abf5;
   --primary-light: #1b2e42;
@@ -3852,7 +4449,11 @@ body { height: 100vh; display: flex; flex-direction: column; background: var(--b
 .mini-badge.chain { background: #ede9fe; color: #6d28d9; }
 [data-theme="dark"] .mini-badge.chain { background: #3b0764; color: #d8b4fe; }
 .mini-badge.high { background: #fee2e2; color: #b91c1c; }
+[data-theme="dark"] .mini-badge.high { background: #450a0a; color: #fca5a5; border: 1px solid #7f1d1d; }
 .mini-badge.deleted { background: #fef3c7; color: #b45309; }
+[data-theme="dark"] .mini-badge.deleted { background: #451a03; color: #fcd34d; border: 1px solid #78350f; }
+[data-theme="dark"] .chain-list-item:hover { background: rgba(71, 158, 245, 0.1); }
+[data-theme="dark"] table.forensic-table tr:hover { background: rgba(71, 158, 245, 0.08); }
 
 /* Pane 3: Mail Chain Reading Pane */
 .reading-pane {
@@ -3895,6 +4496,50 @@ body { height: 100vh; display: flex; flex-direction: column; background: var(--b
 .btn-pane-action:hover { border-color: var(--primary); color: var(--primary); }
 .btn-pane-action.primary { background: var(--primary); color: #fff; border-color: var(--primary); }
 .btn-pane-action.primary:hover { background: var(--primary-hover); color: #fff; }
+
+/* Interactive Mail Chain Flow / Step Timeline Bar */
+.chain-flow-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 7px 10px;
+  background: var(--bg-app);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.chain-flow-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 11.5px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s;
+  color: var(--text-main);
+}
+.chain-flow-step:hover, .chain-flow-step.active {
+  border-color: var(--primary);
+  background: var(--primary-light);
+}
+.chain-flow-num {
+  background: var(--primary);
+  color: #fff;
+  font-weight: 700;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 10px;
+}
+.chain-flow-arrow {
+  color: var(--text-light);
+  font-weight: 700;
+  font-size: 12px;
+  user-select: none;
+}
 
 /* Chain-Level Attachments Strip */
 .chain-attachments-strip {
@@ -4130,20 +4775,157 @@ body { height: 100vh; display: flex; flex-direction: column; background: var(--b
   overflow-x: auto;
   word-break: break-word;
 }
+.email-render-scope { color: var(--text-main); }
 .email-render-scope img { max-width: 100%; height: auto; border-radius: 4px; }
 .email-render-scope table { border-collapse: collapse; max-width: 100%; }
+.email-render-scope a { color: var(--primary); }
+[data-theme="dark"] .email-render-scope,
+[data-theme="dark"] .email-render-scope *:not(a):not(mark):not(img):not(.inline-att-placeholder):not(.inline-sig-badge):not(.quoted-mail-header-badge):not(.quoted-history-summary):not(.btn-att):not(.mini-badge) {
+  color: var(--text-main) !important;
+  background-color: transparent !important;
+  border-color: var(--border) !important;
+}
+[data-theme="dark"] .email-render-scope a { color: #62abf5 !important; background-color: transparent !important; }
+[data-theme="dark"] .email-render-scope hr { border-color: var(--border) !important; }
+[data-theme="dark"] .email-render-scope table,
+[data-theme="dark"] .email-render-scope th,
+[data-theme="dark"] .email-render-scope td {
+  background-color: transparent !important;
+  border-color: var(--border) !important;
+  color: var(--text-main) !important;
+}
+[data-theme="dark"] .email-render-scope blockquote {
+  background-color: rgba(255,255,255,0.03) !important;
+  border-left-color: var(--primary) !important;
+  color: var(--text-muted) !important;
+}
+[data-theme="dark"] .email-render-scope img {
+  background-color: rgba(255,255,255,0.92);
+  border-radius: 4px;
+}
+[data-theme="dark"] .email-render-scope font { color: var(--text-main) !important; }
+[data-theme="dark"] .email-body-container { background: var(--bg-card); color: var(--text-main); }
+[data-theme="dark"] .quoted-history-details { background: var(--bg-msg-head); border-color: var(--primary-border); }
+[data-theme="dark"] .quoted-history-body { background: var(--bg-card); color: var(--text-main); }
+[data-theme="dark"] .att-card { background: var(--bg-card); border-color: var(--border); }
+[data-theme="dark"] .chain-att-chip { background: var(--bg-card); border-color: var(--border); color: var(--text-main); }
+[data-theme="dark"] .btn-pane-action { background: var(--bg-sidebar); color: var(--text-main); border-color: var(--border); }
+[data-theme="dark"] .btn-pane-action.primary { background: var(--primary); color: #fff; border-color: var(--primary); }
+[data-theme="dark"] .search-box,
+[data-theme="dark"] .search-filter-box { background: var(--bg-card); color: var(--text-main); border-color: var(--border); }
+.msg-header-att-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 9px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 700;
+  background: #e0f2fe;
+  color: #0369a1;
+  border: 1px solid #bae6fd;
+}
+[data-theme="dark"] .msg-header-att-pill {
+  background: #0c4a6e;
+  color: #7dd3fc;
+  border-color: #0369a1;
+}
 .email-render-scope blockquote {
   border-left: 3px solid var(--primary);
   padding-left: 12px;
   margin: 8px 0;
   color: var(--text-muted);
 }
+
+/* Inline Attachment Placeholder & Signature Badge inside Email Body */
+.inline-att-placeholder {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  margin: 4px 2px;
+  background: var(--primary-light);
+  border: 1px dashed var(--primary);
+  border-radius: 6px;
+  color: var(--primary);
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+.inline-sig-badge {
+  display: inline-block;
+  padding: 1px 7px;
+  margin: 1px 2px;
+  font-size: 10.5px;
+  background: rgba(128,128,128,0.14);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-muted);
+}
+
+/* Quoted Mail Chain History Container (Clean Outlook '...' Toggle) */
+.quoted-history-details {
+  margin-top: 12px;
+  border: none;
+  background: transparent;
+}
+.quoted-history-summary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 10px;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  color: var(--text-muted);
+  background: var(--bg-app);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+}
+.quoted-history-summary::-webkit-details-marker { display: none; }
+.quoted-history-summary:hover { background: var(--primary-light); color: var(--primary); border-color: var(--primary-border); }
+.quoted-history-body {
+  margin-top: 10px;
+  padding: 12px 14px;
+  border-left: 3px solid var(--border);
+  background: var(--bg-card);
+}
+.outlook-recip-line {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+.quoted-mail-header-card {
+  margin: 14px 0 8px 0;
+  padding: 9px 13px;
+  background: var(--bg-chain-head);
+  border: 1px solid var(--primary-border);
+  border-left: 4px solid var(--primary);
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--text-main);
+  line-height: 1.5;
+}
+.quoted-mail-header-badge {
+  display: inline-block;
+  font-size: 10.5px;
+  font-weight: 700;
+  color: #fff;
+  background: var(--primary);
+  padding: 1px 8px;
+  border-radius: 10px;
+  margin-bottom: 4px;
+}
+
 .plain-text-box {
   white-space: pre-wrap;
   font-family: Consolas, "SFMono-Regular", Menlo, monospace;
   font-size: 13px;
   line-height: 1.55;
   background: var(--bg-app);
+  color: var(--text-main);
   padding: 14px;
   border-radius: 6px;
   border: 1px solid var(--border);
@@ -4342,98 +5124,84 @@ table.forensic-table tr:hover { background: rgba(15, 108, 189, 0.04); }
 <header class="app-header">
   <div class="app-logo">
     <svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zm0 7.5l-6-3 6-3 6 3-6 3zm0 2.5l-10-5v10l10 5 10-5V7l-10 5z"/></svg>
-    <span>Microsoft Outlook Forensic Suite</span>
-    <span class="user-tag" id="headerCaseBadge">Case</span>
+    <span>Outlook</span>
     <span class="user-tag" id="headerUserBadge">Mailbox</span>
+    <span class="user-tag" id="headerCaseBadge" style="opacity:0.85;">Case</span>
   </div>
 
   <div class="header-search-wrapper">
     <div class="header-search-box">
       <span>🔍</span>
-      <input type="text" id="globalSearchInput" class="global-search-input" placeholder="Search all mail chains, subjects, bodies, headers, attachments, LevelDB..." oninput="handleGlobalSearchInput(this.value)" onkeydown="if(event.key==='Enter') runGlobalSearch(this.value)">
+      <input type="text" id="globalSearchInput" class="global-search-input" placeholder="Search mail, people, attachments..." oninput="handleGlobalSearchInput(this.value)" onkeydown="if(event.key==='Enter') runGlobalSearch(this.value)">
       <button id="btnCaseSensitive" class="btn-search-toggle" onclick="toggleCaseSensitive()" title="Match Case (Aa)">Aa</button>
       <button class="btn-clear-search" onclick="clearGlobalSearch()" title="Clear Search">✖</button>
     </div>
   </div>
 
   <div class="header-actions">
-    <a href="/" class="btn-icon" id="btnCaseManager" style="display:none;">🏠 Case Manager</a>
-    <button class="btn-icon" onclick="openCaseFolder()">📂 Case Folder</button>
-    <button class="btn-icon btn-accent" onclick="switchTab('overview')">📊 Audit Overview</button>
-    <button class="btn-icon" onclick="toggleTheme()" id="themeBtn" title="Toggle Dark/Light Theme">🌙</button>
+    <a href="/" class="btn-icon" id="btnCaseManager" style="display:none;">🏠 Cases</a>
+    <button class="btn-icon" onclick="openCaseFolder()" title="Open Case Folder">📂 Folder</button>
+    <button class="btn-icon" onclick="switchTab('overview')" title="Case Audit Summary">📊 Info</button>
+    <button class="btn-icon" onclick="toggleTheme()" id="themeBtn" title="Toggle Dark/Light Mode">🌙</button>
   </div>
 </header>
 
 <div class="app-container">
-  <!-- Left Module Rail -->
+  <!-- Clean Outlook Left Rail -->
   <nav class="nav-rail">
-    <div class="nav-tab active" data-tab="mail" onclick="switchTab('mail')">
+    <div class="nav-tab active" data-tab="mail" onclick="switchTab('mail')" title="Mail">
       <span class="icon">📬</span>
       <span>Mail</span>
     </div>
-    <div class="nav-tab" data-tab="search" onclick="switchTab('search')">
-      <span class="icon">🔍</span>
-      <span>Search</span>
-    </div>
-    <div class="nav-tab" data-tab="attachments" onclick="switchTab('attachments')">
-      <span class="icon">📎</span>
-      <span>Files</span>
-    </div>
-    <div class="nav-tab" data-tab="calendar" onclick="switchTab('calendar')">
+    <div class="nav-tab" data-tab="calendar" onclick="switchTab('calendar')" title="Calendar">
       <span class="icon">📅</span>
       <span>Calendar</span>
     </div>
-    <div class="nav-tab" data-tab="contacts" onclick="switchTab('contacts')">
+    <div class="nav-tab" data-tab="contacts" onclick="switchTab('contacts')" title="People">
       <span class="icon">👥</span>
       <span>People</span>
     </div>
-    <div class="nav-tab" data-tab="leveldb" onclick="switchTab('leveldb')">
-      <span class="icon">🗄️</span>
-      <span>LevelDB</span>
-    </div>
-    <div class="nav-tab" data-tab="overview" onclick="switchTab('overview')">
-      <span class="icon">📊</span>
-      <span>Overview</span>
+    <div class="nav-tab" data-tab="attachments" onclick="switchTab('attachments')" title="Attachments">
+      <span class="icon">📎</span>
+      <span>Files</span>
     </div>
   </nav>
 
-  <!-- TAB 1: 3-Pane Outlook Mail & Mail Chains View -->
+  <!-- TAB 1: Exact 3-Pane Outlook Mail View -->
   <div id="view-mail" style="display:flex; flex:1; overflow:hidden;">
-    <!-- Pane 1: Folders Tree -->
+    <!-- Pane 1: Folders -->
     <aside class="folders-pane">
-      <div class="folders-section-title">Mailbox Folders</div>
+      <div class="folders-section-title">Folders</div>
       <div class="folders-list" id="foldersListContainer"></div>
     </aside>
 
-    <!-- Pane 2: Mail Chains / Conversations List -->
+    <!-- Pane 2: Mail List -->
     <aside class="chains-pane">
       <div class="chains-pane-header">
         <div class="chains-title-row">
           <span class="chains-pane-title" id="currentFolderLabel">All Mailboxes</span>
           <div class="view-mode-switch">
-            <button class="view-mode-btn active" id="btnModeChains" onclick="setListGroupingMode('chains')" title="Group emails into clear Mail Chains">🔗 Chains</button>
-            <button class="view-mode-btn" id="btnModeFlat" onclick="setListGroupingMode('flat')" title="Show individual messages">✉️ Flat</button>
+            <button class="view-mode-btn active" id="btnModeChains" onclick="setListGroupingMode('chains')" title="Conversation View">Threads</button>
+            <button class="view-mode-btn" id="btnModeFlat" onclick="setListGroupingMode('flat')" title="Individual Messages">Messages</button>
           </div>
         </div>
-        <input type="text" id="chainFilterInput" class="search-box" placeholder="Filter mail chains by subject, sender, content..." oninput="renderChainsList()">
+        <input type="text" id="chainFilterInput" class="search-box" placeholder="Filter this folder..." oninput="renderChainsList()">
         <div class="filter-pills-row">
           <span class="filter-pill active" data-filter="all" onclick="setQuickFilter('all', this)">All</span>
-          <span class="filter-pill" data-filter="multi" onclick="setQuickFilter('multi', this)">🔗 Chains (2+)</span>
-          <span class="filter-pill" data-filter="att" onclick="setQuickFilter('att', this)">📎 Attachments</span>
-          <span class="filter-pill" data-filter="high" onclick="setQuickFilter('high', this)">❗ High Priority</span>
-          <span class="filter-pill" data-filter="deleted" onclick="setQuickFilter('deleted', this)">🗑️ Deleted</span>
-          <span class="filter-pill" data-filter="unread" onclick="setQuickFilter('unread', this)">✉️ Unread</span>
+          <span class="filter-pill" data-filter="unread" onclick="setQuickFilter('unread', this)">Unread</span>
+          <span class="filter-pill" data-filter="att" onclick="setQuickFilter('att', this)">📎 Has Files</span>
+          <span class="filter-pill" data-filter="multi" onclick="setQuickFilter('multi', this)">Chains</span>
         </div>
       </div>
       <div class="chains-list" id="chainsListContainer"></div>
     </aside>
 
-    <!-- Pane 3: Mail Chain Reading Stage -->
+    <!-- Pane 3: Outlook Reading Pane -->
     <main class="reading-pane" id="readingPaneContainer">
       <div class="empty-placeholder">
         <div class="icon">📬</div>
-        <h3>Select a Mail Chain to inspect</h3>
-        <p style="font-size:13px; max-width:420px;">Choose a conversation thread from the list on the left to view the complete mail chain, headers, and extracted attachments.</p>
+        <h3>Select an item to read</h3>
+        <p style="font-size:13px; max-width:360px;">Nothing is selected.</p>
       </div>
     </main>
   </div>
@@ -4586,6 +5354,16 @@ function highlightHtmlSafe(htmlStr, kw) {
 }
 
 function initViewer() {
+  try {
+    const savedTheme = localStorage.getItem("outlook_forensic_theme");
+    if (savedTheme === "dark" || savedTheme === "light") {
+      document.documentElement.setAttribute("data-theme", savedTheme);
+      document.body.setAttribute("data-theme", savedTheme);
+      const tBtn = document.getElementById("themeBtn");
+      if (tBtn) tBtn.innerText = savedTheme === "dark" ? "☀️" : "🌙";
+    }
+  } catch (e) {}
+
   if (window.location.protocol.startsWith("http")) {
     const cmBtn = document.getElementById("btnCaseManager");
     if (cmBtn) cmBtn.style.display = "inline-flex";
@@ -4847,22 +5625,48 @@ function selectMailChain(chainId, focusMsgId = null) {
 
   const foldersBadges = (chain.folders || []).map(f => `<span class="mini-badge">${getFolderIcon(f)} ${esc(f)}</span>`).join(" ");
 
-  // Build Chain-Level Attachments Summary Strip
+  // Build Interactive Mail Chain Flow Timeline Bar
+  let chainFlowBarHtml = "";
+  if (msgs.length > 1) {
+    const stepsHtml = msgs.map((m, idx) => {
+      const attCnt = (m.attachments || []).length;
+      const shortSender = (m.sender_name || m.sender_email || "Unknown").split(" ").slice(0, 2).join(" ");
+      const shortTime = (m.time_local || m.time_utc || "").slice(5, 16);
+      const arrow = idx > 0 ? `<span class="chain-flow-arrow">&rarr;</span>` : "";
+      return `${arrow}<div class="chain-flow-step ${focusMsgId === m.id ? 'active' : ''}" onclick="jumpToMessageInChain('${esc(m.id)}')" title="${esc(m.sender_display)} • ${esc(m.time_local || m.time_utc)}">
+        <span class="chain-flow-num">#${m.chain_index}</span>
+        <span style="font-weight:600;">${esc(shortSender)}</span>
+        ${shortTime ? `<span style="font-size:10.5px; color:var(--text-muted);">${esc(shortTime)}</span>` : ""}
+        ${attCnt > 0 ? `<span class="mini-badge att">📎 ${attCnt}</span>` : ""}
+      </div>`;
+    }).join("");
+    chainFlowBarHtml = `
+      <div class="chain-flow-bar">
+        <span style="font-size:11px; font-weight:700; color:var(--text-muted); white-space:nowrap;">🔗 Mail Chain Flow:</span>
+        ${stepsHtml}
+      </div>
+    `;
+  }
+
+  // Build Chain-Level Attachments Summary Strip (showing which mail # each attachment belongs to)
   let chainAttStripHtml = "";
   if ((chain.attachments || []).length > 0) {
     const chips = chain.attachments.map(att => {
       const icon = getAttachmentIcon(att.category, att.contentType, att.fileName);
+      const msgBadge = att.chain_index ? `<span class="mini-badge chain" style="font-size:9.5px;">Mail #${att.chain_index}</span>` : "";
+      const sizeStr = att.size ? `(${formatBytes(att.size)})` : (att.attachmentSource ? `(${att.attachmentSource})` : "");
       return `
-        <div class="chain-att-chip" onclick="openAttachmentPreview('${esc(att.att_id)}')" title="Click to preview ${esc(att.fileName)} (${formatBytes(att.size)})">
+        <div class="chain-att-chip" onclick="openAttachmentPreview('${esc(att.att_id)}')" title="Attached in Mail #${att.chain_index || '?'} • Click to preview ${esc(att.fileName)}">
+          ${msgBadge}
           <span>${icon}</span>
           <span style="font-weight:600; color:var(--text-main);">${esc(att.fileName)}</span>
-          <span style="color:var(--text-muted); font-size:11px;">(${formatBytes(att.size)})</span>
+          ${sizeStr ? `<span style="color:var(--text-muted); font-size:11px;">${esc(sizeStr)}</span>` : ""}
         </div>
       `;
     }).join("");
     chainAttStripHtml = `
       <div class="chain-attachments-strip">
-        <span style="font-size:11.5px; font-weight:700; color:var(--primary); white-space:nowrap;">📎 Chain Attachments (${chain.attachments.length}):</span>
+        <span style="font-size:11.5px; font-weight:700; color:var(--primary); white-space:nowrap;">📎 All Chain Attachments (${chain.attachments.length}):</span>
         ${chips}
       </div>
     `;
@@ -4877,63 +5681,46 @@ function selectMailChain(chainId, focusMsgId = null) {
       ? `Original Email (#1 of ${chain.msg_count})`
       : `Chain Reply #${m.chain_index} of ${chain.msg_count}${m.reply_depth > 0 ? ` • Depth L${m.reply_depth}` : ""}`;
 
-    const toPills = (m.to_recipients || []).map(r => `<span class="recip-pill">${highlightTextSafe(r.display || r.email || r.name, activeSearchKeyword)}</span>`).join("") || `<span style="color:var(--text-light);">—</span>`;
-    const ccRow = (m.cc_recipients && m.cc_recipients.length > 0)
-      ? `<div class="env-label">Cc:</div><div class="env-val">${m.cc_recipients.map(r => `<span class="recip-pill">${highlightTextSafe(r.display || r.email || r.name, activeSearchKeyword)}</span>`).join("")}</div>`
+    const toStr = (m.to_recipients || []).map(r => highlightTextSafe(r.name || r.email || r.display, activeSearchKeyword)).join("; ") || "—";
+    const ccStr = (m.cc_recipients && m.cc_recipients.length > 0)
+      ? `<div class="outlook-recip-line"><b>Cc:</b> ${m.cc_recipients.map(r => highlightTextSafe(r.name || r.email || r.display, activeSearchKeyword)).join("; ")}</div>`
       : "";
-    const bccRow = (m.bcc_recipients && m.bcc_recipients.length > 0)
-      ? `<div class="env-label">Bcc:</div><div class="env-val">${m.bcc_recipients.map(r => `<span class="recip-pill bcc">🕵️ ${highlightTextSafe(r.display || r.email || r.name, activeSearchKeyword)}</span>`).join("")}</div>`
-      : "";
-    const replyToRow = (m.reply_to && m.reply_to.length > 0)
-      ? `<div class="env-label">Reply-To:</div><div class="env-val">${m.reply_to.map(r => `<span class="recip-pill">${esc(r.display)}</span>`).join("")}</div>`
+    const bccStr = (m.bcc_recipients && m.bcc_recipients.length > 0)
+      ? `<div class="outlook-recip-line"><b>Bcc:</b> ${m.bcc_recipients.map(r => `<span class="recip-pill bcc">${highlightTextSafe(r.display || r.email || r.name, activeSearchKeyword)}</span>`).join(" ")}</div>`
       : "";
 
-    // Message Attachments Block
+    // Clean Outlook Per-Mail Attachment Pills (ONLY real attached files)
     let msgAttHtml = "";
     if ((m.attachments || []).length > 0) {
-      const cards = m.attachments.map(att => {
+      const pills = m.attachments.map(att => {
         const icon = getAttachmentIcon(att.category, att.contentType, att.fileName);
         const fileUrl = resolveAttachmentUrl(att.rel_path);
-        const isImg = att.category === "Image" && att.extracted && fileUrl;
-        const thumbHtml = isImg
-          ? `<img src="${esc(fileUrl)}" alt="${esc(att.fileName)}" onerror="this.parentElement.innerText='🖼️'">`
-          : `<span>${icon}</span>`;
-        const shaShort = att.sha256 ? `SHA256: ${att.sha256.slice(0, 12)}...` : "Metadata Recorded";
-
+        const sizeLabel = att.size ? formatBytes(att.size) : (att.attachmentSource || "File");
         return `
-          <div class="att-card">
-            <div class="att-icon-thumb" onclick="openAttachmentPreview('${esc(att.att_id)}')" style="cursor:pointer;">
-              ${thumbHtml}
+          <div class="att-card" style="padding:7px 10px; gap:8px;">
+            <div class="att-icon-thumb" onclick="openAttachmentPreview('${esc(att.att_id)}')" style="cursor:pointer; width:34px; height:34px; font-size:18px;">
+              <span>${icon}</span>
             </div>
             <div class="att-meta">
               <div class="att-filename" title="${esc(att.fileName)}">${highlightTextSafe(att.fileName, activeSearchKeyword)}</div>
-              <div class="att-subinfo">
-                <span><b>${formatBytes(att.size)}</b></span>
-                <span>•</span>
-                <span>${esc(att.category || att.contentType)}</span>
-                ${att.isInline ? `<span class="mini-badge att">Inline CID</span>` : ""}
-              </div>
-              <div class="att-subinfo" style="font-family:Consolas, monospace; font-size:10px;" title="SHA-256: ${esc(att.sha256 || 'N/A')}">
-                ${esc(shaShort)}
-              </div>
+              <div class="att-subinfo"><span>${esc(sizeLabel)}</span></div>
             </div>
-            <div class="att-actions">
-              <button class="btn-att" onclick="openAttachmentPreview('${esc(att.att_id)}')">👁️ Preview</button>
-              ${att.extracted && fileUrl ? `<a class="btn-att" href="${esc(fileUrl)}" download="${esc(att.fileName)}">⬇️ Save</a>` : ""}
+            <div class="att-actions" style="flex-direction:row; gap:4px;">
+              <button class="btn-att" onclick="openAttachmentPreview('${esc(att.att_id)}')" title="Preview">👁️</button>
+              ${att.extracted && fileUrl ? `<a class="btn-att" href="${esc(fileUrl)}" download="${esc(att.fileName)}" title="Download">⬇️</a>` : ""}
+              ${att.externalUrl ? `<a class="btn-att" href="${esc(att.externalUrl)}" target="_blank" rel="noopener" title="Open Link">🔗</a>` : ""}
             </div>
           </div>
         `;
       }).join("");
 
       msgAttHtml = `
-        <div class="msg-attachments-bar">
-          <div style="font-size:11.5px; font-weight:700; color:var(--text-muted);">📎 Attached Files on Message #${m.chain_index} (${m.attachments.length}):</div>
-          <div class="msg-att-grid">${cards}</div>
+        <div class="msg-attachments-bar" style="padding:9px 18px;">
+          <div class="msg-att-grid" style="grid-template-columns:repeat(auto-fill, minmax(220px, 1fr)); gap:8px;">${pills}</div>
         </div>
       `;
     }
 
-    // Prepare Rich HTML, Plain Text, and Forensic Headers/MAPI views
     const hasRichHtml = Boolean(m.body_html_clean && m.body_html_clean.trim());
     const richBodyContent = hasRichHtml
       ? `<div class="email-render-scope">${highlightHtmlSafe(m.body_html_clean, activeSearchKeyword)}</div>`
@@ -4979,10 +5766,8 @@ function selectMailChain(chainId, focusMsgId = null) {
       </div>
     `;
 
-    const indentPx = Math.min((m.reply_depth || 0) * 14, 56);
-
     return `
-      <div class="email-chain-node" id="msg-node-${esc(m.id)}" style="margin-left:${indentPx}px;">
+      <div class="email-chain-node" id="msg-node-${esc(m.id)}">
         ${idx > 0 ? `<div class="email-chain-connector"></div>` : ""}
         <div class="email-card ${isTarget ? 'highlight-target' : ''}">
           <div class="email-card-header" onclick="toggleEmailCardBody('${esc(m.id)}')">
@@ -4993,45 +5778,29 @@ function selectMailChain(chainId, focusMsgId = null) {
                   <div class="email-sender-title">
                     <span>${highlightTextSafe(m.sender_name || m.sender_email, activeSearchKeyword)}</span>
                     ${m.sender_email ? `<span class="email-sender-addr">&lt;${highlightTextSafe(m.sender_email, activeSearchKeyword)}&gt;</span>` : ""}
-                    <span class="email-step-badge">${esc(stepLabel)}</span>
-                    <span class="mini-badge">${getFolderIcon(m.folder)} ${esc(m.folder)}</span>
-                    ${m.importance === "High" ? `<span class="mini-badge high">❗ High Importance</span>` : ""}
-                    ${m.is_deleted ? `<span class="mini-badge deleted">🗑️ Deleted / Recovered</span>` : ""}
-                    ${m.is_draft ? `<span class="mini-badge">📝 Draft</span>` : ""}
+                    ${(m.attachments || []).length > 0 ? `<span class="msg-header-att-pill" title="${esc((m.attachments || []).map(a => a.fileName).join(', '))}">📎 ${m.attachments.length}</span>` : ""}
+                    ${m.importance === "High" ? `<span class="mini-badge high">❗ High</span>` : ""}
+                    ${m.is_deleted ? `<span class="mini-badge deleted">🗑️ Deleted</span>` : ""}
                   </div>
                   <div style="font-size:12px; color:var(--text-muted); margin-top:2px;">
-                    <b>Subject:</b> ${highlightTextSafe(m.subject, activeSearchKeyword)}
+                    <b>To:</b> ${toStr}
                   </div>
+                  ${ccStr}${bccStr}
                 </div>
               </div>
-              <div class="email-timestamps-box">
-                <div><b>${esc(m.time_local || m.time_utc || "Timestamp N/A")}</b> <span style="font-size:10px; opacity:0.8;">(Local/IST)</span></div>
-                ${m.time_utc ? `<div style="font-size:11px; color:var(--text-light);">🌐 ${esc(m.time_utc)}</div>` : ""}
+              <div class="email-timestamps-box" onclick="event.stopPropagation()">
+                <div style="font-weight:600; color:var(--text-main);">${esc(m.time_local || m.time_utc || "")}</div>
+                <div class="body-mode-tabs" style="margin-top:4px;">
+                  <button class="body-tab-btn active" id="tab-btn-rich-${esc(m.id)}" onclick="switchMessageBodyTab('${esc(m.id)}', 'rich')" style="padding:2px 7px; font-size:10.5px;">Mail</button>
+                  <button class="body-tab-btn" id="tab-btn-plain-${esc(m.id)}" onclick="switchMessageBodyTab('${esc(m.id)}', 'plain')" style="padding:2px 7px; font-size:10.5px;">Text</button>
+                  <button class="body-tab-btn" id="tab-btn-meta-${esc(m.id)}" onclick="switchMessageBodyTab('${esc(m.id)}', 'meta')" style="padding:2px 7px; font-size:10.5px;">Headers</button>
+                </div>
               </div>
-            </div>
-
-            <div class="email-envelope-grid" onclick="event.stopPropagation()">
-              <div class="env-label">From:</div>
-              <div class="env-val"><span class="recip-pill"><b>${highlightTextSafe(m.sender_display || m.sender_name, activeSearchKeyword)}</b></span></div>
-              <div class="env-label">To:</div>
-              <div class="env-val">${toPills}</div>
-              ${ccRow}
-              ${bccRow}
-              ${replyToRow}
             </div>
           </div>
 
           <div id="email-body-wrap-${esc(m.id)}">
             ${msgAttHtml}
-            <div class="email-view-toolbar">
-              <div class="body-mode-tabs">
-                <button class="body-tab-btn active" id="tab-btn-rich-${esc(m.id)}" onclick="switchMessageBodyTab('${esc(m.id)}', 'rich')">🖼️ Rich Email View</button>
-                <button class="body-tab-btn" id="tab-btn-plain-${esc(m.id)}" onclick="switchMessageBodyTab('${esc(m.id)}', 'plain')">📝 Unaltered Plain Text</button>
-                <button class="body-tab-btn" id="tab-btn-meta-${esc(m.id)}" onclick="switchMessageBodyTab('${esc(m.id)}', 'meta')">🔬 Headers & Forensic Metadata</button>
-              </div>
-              <span style="font-size:11px; color:var(--text-light); font-family:Consolas,monospace;">Source: ${esc(m.source_file)}</span>
-            </div>
-
             <div class="email-body-container" id="body-pane-rich-${esc(m.id)}">${richBodyContent}</div>
             <div class="email-body-container" id="body-pane-plain-${esc(m.id)}" style="display:none;">${plainBodyContent}</div>
             <div class="email-body-container" id="body-pane-meta-${esc(m.id)}" style="display:none;">${forensicMetaContent}</div>
@@ -5042,28 +5811,22 @@ function selectMailChain(chainId, focusMsgId = null) {
   }).join("");
 
   pane.innerHTML = `
-    <div class="chain-header-bar">
+    <div class="chain-header-bar" style="padding:12px 20px;">
       <div class="chain-header-top">
-        <div style="flex:1; min-width:260px;">
+        <div style="flex:1; min-width:240px;">
           <div class="chain-subject-title">${highlightTextSafe(chain.subject, activeSearchKeyword)}</div>
           <div class="chain-meta-sub">
             ${foldersBadges}
-            <span>•</span>
-            <span><b>${chain.msg_count}</b> ${chain.msg_count === 1 ? "Email" : "Emails in Chain"}</span>
-            <span>•</span>
-            <span><b>${(chain.participants || []).length}</b> Participants</span>
-            <span>•</span>
-            <span><b>${chain.attachment_count || 0}</b> Attachments</span>
-            ${chain.first_time_local ? `<span>•</span><span>Timeline: <b>${esc(chain.first_time_local)}</b> &rarr; <b>${esc(chain.last_time_local)}</b></span>` : ""}
+            <span><b>${chain.msg_count}</b> ${chain.msg_count === 1 ? "message" : "messages"}</span>
+            ${chain.attachment_count > 0 ? `<span>•</span><span>📎 <b>${chain.attachment_count}</b> ${chain.attachment_count === 1 ? "attachment" : "attachments"}</span>` : ""}
           </div>
         </div>
         <div class="chain-actions-group">
-          <button class="btn-pane-action" onclick="toggleAllMessagesInChain()">↕️ Expand / Collapse All</button>
+          <button class="btn-pane-action" onclick="toggleAllMessagesInChain()">↕️ Collapse/Expand</button>
           <button class="btn-pane-action" onclick="reverseChainOrder()">🔄 ${chainSortReverse ? "Newest First" : "Oldest First"}</button>
-          <button class="btn-pane-action primary" onclick="exportMailChainHtml('${esc(chain.chain_id)}')">🖨️ Export Mail Chain HTML / PDF</button>
+          <button class="btn-pane-action primary" onclick="exportMailChainHtml('${esc(chain.chain_id)}')">🖨️ Export</button>
         </div>
       </div>
-      ${chainAttStripHtml}
     </div>
     <div class="chain-messages-scroll" id="chainMessagesScrollBox">
       ${messagesCardsHtml}
@@ -5075,6 +5838,21 @@ function selectMailChain(chainId, focusMsgId = null) {
       const targetEl = document.getElementById("msg-node-" + focusMsgId);
       if (targetEl) targetEl.scrollIntoView({ behavior: "smooth", block: "center" });
     }, 80);
+  }
+}
+
+function jumpToMessageInChain(msgId) {
+  const wrap = document.getElementById("email-body-wrap-" + msgId);
+  if (wrap && wrap.style.display === "none") wrap.style.display = "block";
+  const node = document.getElementById("msg-node-" + msgId);
+  if (node) {
+    node.scrollIntoView({ behavior: "smooth", block: "start" });
+    const card = node.querySelector(".email-card");
+    if (card) {
+      document.querySelectorAll(".email-card.highlight-target").forEach(el => el.classList.remove("highlight-target"));
+      card.classList.add("highlight-target");
+      setTimeout(() => card.classList.remove("highlight-target"), 2400);
+    }
   }
 }
 
@@ -5139,6 +5917,13 @@ function openAttachmentPreview(attId) {
         <a href="${esc(fileUrl)}" download="${esc(att.fileName)}" class="btn-pane-action primary" style="display:inline-flex;">⬇️ Download ${esc(att.fileName)} (${formatBytes(att.size)})</a>
       </div>`;
     }
+  } else if (att.externalUrl) {
+    previewBox = `<div style="padding:22px; text-align:center; background:var(--bg-app); border-radius:8px; border:1px solid var(--border);">
+      <div style="font-size:38px; margin-bottom:8px;">${icon}</div>
+      <div style="font-weight:700; margin-bottom:6px; color:var(--text-main);">Cloud / Linked File Attachment</div>
+      <div style="font-size:12px; color:var(--text-muted); margin-bottom:12px; word-break:break-all; font-family:Consolas,monospace;">${esc(att.externalUrl)}</div>
+      <a href="${esc(att.externalUrl)}" target="_blank" rel="noopener" class="btn-pane-action primary" style="display:inline-flex;">🔗 Open External File Link</a>
+    </div>`;
   } else {
     previewBox = `<div style="padding:20px; text-align:center; background:var(--bg-app); border-radius:8px; border:1px solid var(--border); color:var(--text-muted);">
       Attachment metadata recorded in forensic database, binary stream was not cached locally on disk.
@@ -5771,11 +6556,15 @@ function openCaseFolder() {
 }
 
 function toggleTheme() {
-  const body = document.body;
-  const cur = body.getAttribute("data-theme");
+  const cur = document.body.getAttribute("data-theme") || document.documentElement.getAttribute("data-theme");
   const next = cur === "dark" ? "light" : "dark";
-  body.setAttribute("data-theme", next);
-  document.getElementById("themeBtn").innerText = next === "dark" ? "☀️" : "🌙";
+  document.documentElement.setAttribute("data-theme", next);
+  document.body.setAttribute("data-theme", next);
+  const btn = document.getElementById("themeBtn");
+  if (btn) btn.innerText = next === "dark" ? "☀️" : "🌙";
+  try {
+    localStorage.setItem("outlook_forensic_theme", next);
+  } catch (e) {}
 }
 
 window.addEventListener("DOMContentLoaded", initViewer);
