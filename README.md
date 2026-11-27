@@ -43,13 +43,6 @@ pip install --no-deps dfindexeddb
 ```bash
 python outlook_forensic_tool.py
 ```
-
-### 2. Direct Command-Line Extraction
-```bash
-python outlook_forensic_tool.py "%LOCALAPPDATA%\Microsoft\Olk" --case NewOutlook_Audit --no-browser
-python outlook_forensic_tool.py "C:\Evidence\custodian_mailbox.pst" --case Custodian_PST --no-browser
-```
-
 ---
 
 ## Output Structure
